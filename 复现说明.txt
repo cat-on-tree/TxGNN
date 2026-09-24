@@ -1,0 +1,5 @@
+目前在该环境下完成复现：
+PyTorch: 2.0.1
+DGL: 1.0.2（需在anaconda合作库进行安装）
+goatools（需在anaconda合作库进行安装）
+requirements.txt中包含了所需的其他依赖包
