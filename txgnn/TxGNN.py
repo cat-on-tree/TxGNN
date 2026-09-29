@@ -64,20 +64,24 @@ class TxGNN:
         else:
             self.wandb = None
         self.config = None
-        
-    def model_initialize(self, n_hid = 128, 
-                               n_inp = 128, 
-                               n_out = 128, 
+
+    def model_initialize(self, n_hid = 128,
+                               n_inp = 128,
+                               n_out = 128,
                                proto = True,
                                proto_num = 5,
                                attention = False,
                                sim_measure = 'all_nodes_profile',
                                bert_measure = 'disease_name',
-                               agg_measure = 'rarity', 
+                               agg_measure = 'rarity',
                                exp_lambda = 0.7,
                                num_walks = 200,
                                walk_mode = 'bit',
-                               path_length = 2):
+                               path_length = 2,
+                               model_type ='txgnn',
+                               hgt_num_heads = 4,
+                               hgt_dropout = 0.2,
+                               hgt_use_norm = True):
         
         if self.no_kg and proto:
             print('Ablation study on No-KG. No proto learning is used...')
@@ -99,27 +103,65 @@ class TxGNN:
                        'agg_measure': agg_measure,
                        'num_walks': num_walks,
                        'walk_mode': walk_mode,
-                       'path_length': path_length
+                       'path_length': path_length,
+                       'model_type': model_type,
+                       'hgt_num_heads': hgt_num_heads,
+                       'hgt_dropout': hgt_dropout,
+                       'hgt_use_norm': hgt_use_norm
                       }
 
-        self.model = HeteroRGCN(self.G,
-                   in_size=n_inp,
-                   hidden_size=n_hid,
-                   out_size=n_out,
-                   attention = attention,
-                   proto = proto,
-                   proto_num = proto_num,
-                   sim_measure = sim_measure,
-                   bert_measure = bert_measure, 
-                   agg_measure = agg_measure,
-                   num_walks = num_walks,
-                   walk_mode = walk_mode,
-                   path_length = path_length,
-                   split = self.split,
-                   data_folder = self.data_folder,
-                   exp_lambda = exp_lambda,
-                   device = self.device
-                  ).to(self.device)    
+        if model_type == "hgt":
+            if attention:
+                print("Warning: attention=True is ignored when model_type='hgt'.")
+
+            if proto:
+                print(
+                    "Warning: HGT baseline is usually run with proto=False. "
+                    "Proceeding with the supplied proto=True setting."
+                )
+
+            self.model = HGTGraphModel(
+                self.G,
+                in_size=n_inp,
+                hidden_size=n_hid,
+                out_size=n_out,
+                proto=proto,
+                proto_num=proto_num,
+                sim_measure=sim_measure,
+                bert_measure=bert_measure,
+                agg_measure=agg_measure,
+                num_walks=num_walks,
+                walk_mode=walk_mode,
+                path_length=path_length,
+                split=self.split,
+                data_folder=self.data_folder,
+                exp_lambda=exp_lambda,
+                device=self.device,
+                hgt_num_heads=hgt_num_heads,
+                hgt_dropout=hgt_dropout,
+                hgt_use_norm=hgt_use_norm,
+            ).to(self.device)
+
+        else:
+            self.model = HeteroRGCN(
+                self.G,
+                in_size=n_inp,
+                hidden_size=n_hid,
+                out_size=n_out,
+                attention=attention,
+                proto=proto,
+                proto_num=proto_num,
+                sim_measure=sim_measure,
+                bert_measure=bert_measure,
+                agg_measure=agg_measure,
+                num_walks=num_walks,
+                walk_mode=walk_mode,
+                path_length=path_length,
+                split=self.split,
+                data_folder=self.data_folder,
+                exp_lambda=exp_lambda,
+                device=self.device,
+            ).to(self.device)
         self.best_model = self.model
         
     def pretrain(self, n_epoch = 1, learning_rate = 1e-3, batch_size = 1024, train_print_per_n = 20, sweep_wandb = None):

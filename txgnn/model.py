@@ -1,4 +1,5 @@
 import dgl
+from dgl.nn.pytorch import HGTConv
 from dgl.ops import edge_softmax
 import math
 import numpy as np
@@ -294,7 +295,224 @@ class DistMultPredictor(nn.Module):
             return scores, s_l
 
 
-    
+class HGTLayer(nn.Module):
+
+    def __init__(
+        self,
+        G,
+        in_size,
+        out_size,
+        num_heads=4,
+        dropout=0.2,
+        use_norm=True,
+    ):
+        super().__init__()
+
+        if HGTConv is None:
+            raise ImportError(
+                "DGL HGTConv is not available. Please use a DGL version that provides "
+                "`dgl.nn.pytorch.HGTConv`, or install/update DGL."
+            )
+
+        if out_size % num_heads != 0:
+            raise ValueError(
+                f"HGT out_size={out_size} must be divisible by num_heads={num_heads}."
+            )
+
+        self.ntypes = list(G.ntypes)
+        self.etypes = list(G.etypes)
+        self.out_size = out_size
+        self.num_heads = num_heads
+
+        self.conv = HGTConv(
+            in_size=in_size,
+            head_size=out_size // num_heads,
+            num_heads=num_heads,
+            num_ntypes=len(self.ntypes),
+            num_etypes=len(self.etypes),
+            dropout=dropout,
+            use_norm=use_norm,
+        )
+
+    def forward(self, G, feat_dict):
+        # DGL HGTConv works on homogeneous graphs with node/edge type tensors.
+        device = next(iter(feat_dict.values())).device
+
+        hg = dgl.to_homogeneous(G).to(device)
+
+        x = torch.cat(
+            [feat_dict[ntype] for ntype in self.ntypes],
+            dim=0,
+        ).to(device)
+
+        ntype = hg.ndata[dgl.NTYPE].to(device)
+        etype = hg.edata[dgl.ETYPE].to(device)
+
+        h_all = self.conv(hg, x, ntype, etype)
+
+        out = {}
+        start = 0
+        for ntype in self.ntypes:
+            n_nodes = G.number_of_nodes(ntype)
+            out[ntype] = h_all[start:start + n_nodes]
+            start += n_nodes
+
+        return out
+
+
+class HGTGraphModel(nn.Module):
+    """
+    HGT backbone + TxGNN DistMult predictor.
+
+    This is a graph-backbone baseline:
+    - HGT encoder for heterogeneous message passing;
+    - same DistMultPredictor as TxGNN for link scoring;
+    - compatible with TxGNN.finetune(), TxGNN.predict(), and external fixed tests.
+
+    Recommended use:
+        proto=False
+        attention=False
+        model_type='hgt'
+
+    Minibatch pretraining is intentionally not implemented for HGT here.
+    """
+    def __init__(
+        self,
+        G,
+        in_size,
+        hidden_size,
+        out_size,
+        proto,
+        proto_num,
+        sim_measure,
+        bert_measure,
+        agg_measure,
+        num_walks,
+        walk_mode,
+        path_length,
+        split,
+        data_folder,
+        exp_lambda,
+        device,
+        hgt_num_heads=4,
+        hgt_dropout=0.2,
+        hgt_use_norm=True,
+    ):
+        super().__init__()
+
+        self.layer1 = HGTLayer(
+            G=G,
+            in_size=in_size,
+            out_size=hidden_size,
+            num_heads=hgt_num_heads,
+            dropout=hgt_dropout,
+            use_norm=hgt_use_norm,
+        )
+
+        self.layer2 = HGTLayer(
+            G=G,
+            in_size=hidden_size,
+            out_size=out_size,
+            num_heads=hgt_num_heads,
+            dropout=hgt_dropout,
+            use_norm=hgt_use_norm,
+        )
+
+        self.w_rels = nn.Parameter(torch.Tensor(len(G.canonical_etypes), out_size))
+        nn.init.xavier_uniform_(self.w_rels, gain=nn.init.calculate_gain("relu"))
+
+        rel2idx = dict(zip(G.canonical_etypes, list(range(len(G.canonical_etypes)))))
+
+        self.pred = DistMultPredictor(
+            n_hid=hidden_size,
+            w_rels=self.w_rels,
+            G=G,
+            rel2idx=rel2idx,
+            proto=proto,
+            proto_num=proto_num,
+            sim_measure=sim_measure,
+            bert_measure=bert_measure,
+            agg_measure=agg_measure,
+            num_walks=num_walks,
+            walk_mode=walk_mode,
+            path_length=path_length,
+            split=split,
+            data_folder=data_folder,
+            exp_lambda=exp_lambda,
+            device=device,
+        )
+
+        self.hidden_size = hidden_size
+        self.out_size = out_size
+        self.etypes = G.etypes
+        self.device = device
+        self.hgt_num_heads = hgt_num_heads
+        self.hgt_dropout = hgt_dropout
+        self.hgt_use_norm = hgt_use_norm
+
+    def forward_minibatch(self, pos_G, neg_G, blocks, G, mode="train", pretrain_mode=False):
+        raise NotImplementedError(
+            "HGTGraphModel does not support TxGNN minibatch pretraining. "
+            "Use full-batch finetune() for the HGT baseline."
+        )
+
+    def forward(
+        self,
+        G,
+        neg_G,
+        eval_pos_G=None,
+        return_h=False,
+        return_att=False,
+        mode="train",
+        pretrain_mode=False,
+    ):
+        if return_att:
+            raise NotImplementedError("return_att is not implemented for HGTGraphModel.")
+
+        with G.local_scope():
+            input_dict = {ntype: G.nodes[ntype].data["inp"] for ntype in G.ntypes}
+
+            h_dict = self.layer1(G, input_dict)
+            h_dict = {k: F.leaky_relu(h) for k, h in h_dict.items()}
+            h = self.layer2(G, h_dict)
+
+            if return_h:
+                return h
+
+            if eval_pos_G is not None:
+                scores, out_pos = self.pred(
+                    eval_pos_G,
+                    G,
+                    h,
+                    pretrain_mode,
+                    mode=mode + "_pos",
+                )
+                scores_neg, out_neg = self.pred(
+                    neg_G,
+                    G,
+                    h,
+                    pretrain_mode,
+                    mode=mode + "_neg",
+                )
+                return scores, scores_neg, out_pos, out_neg
+
+            scores, out_pos = self.pred(
+                G,
+                G,
+                h,
+                pretrain_mode,
+                mode=mode + "_pos",
+            )
+            scores_neg, out_neg = self.pred(
+                neg_G,
+                G,
+                h,
+                pretrain_mode,
+                mode=mode + "_neg",
+            )
+            return scores, scores_neg, out_pos, out_neg
+
+
 class AttHeteroRGCNLayer(nn.Module):
     def __init__(self, in_size, out_size, etypes):
         super(AttHeteroRGCNLayer, self).__init__()
