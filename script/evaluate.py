@@ -110,6 +110,106 @@ def infer_negative_ratio(df):
     return ratio
 
 
+def infer_strategy_from_name(name):
+    """
+    Infer negative sampling strategy from filename.
+
+    Important:
+    - Check degree_matched_head / degree_matched_tail BEFORE generic "degree".
+    - Otherwise both endpoint-specific hard sets collapse into "degree_matched".
+    """
+    lower = str(name).lower()
+
+    head_patterns = [
+        "degree_matched_head",
+        "degree-matched-head",
+        "degree_head",
+        "degree-head",
+        "head_degree",
+        "head-degree",
+    ]
+    tail_patterns = [
+        "degree_matched_tail",
+        "degree-matched-tail",
+        "degree_tail",
+        "degree-tail",
+        "tail_degree",
+        "tail-degree",
+    ]
+
+    if any(p in lower for p in head_patterns):
+        return "degree_matched_head"
+
+    if any(p in lower for p in tail_patterns):
+        return "degree_matched_tail"
+
+    if "degree" in lower and "head" in lower:
+        return "degree_matched_head"
+
+    if "degree" in lower and "tail" in lower:
+        return "degree_matched_tail"
+
+    if "degree" in lower or "hard" in lower:
+        return "degree_matched"
+
+    if "random" in lower:
+        return "random"
+
+    if "normal" in lower:
+        return "normal"
+
+    return "unknown"
+
+
+def resolve_strategy_from_manifest_or_name(manifest_strategy, file_name):
+    """
+    Resolve final strategy label.
+
+    Prefer endpoint-specific information from the file name because some older
+    manifests may store both degree_matched_head and degree_matched_tail as
+    generic "degree_matched".
+    """
+    inferred = infer_strategy_from_name(file_name)
+
+    if inferred in {"degree_matched_head", "degree_matched_tail"}:
+        return inferred
+
+    if manifest_strategy is None:
+        return inferred
+
+    if isinstance(manifest_strategy, float) and np.isnan(manifest_strategy):
+        return inferred
+
+    strategy = str(manifest_strategy)
+
+    if strategy in {"", "nan", "None", "unknown"}:
+        return inferred
+
+    if strategy == "degree_matched" and inferred in {
+        "degree_matched_head",
+        "degree_matched_tail",
+    }:
+        return inferred
+
+    return strategy
+
+
+def infer_seed_from_name(name):
+    import re
+
+    lower = str(name).lower()
+    patterns = [
+        r"seed[_-]?(\d+)",
+        r"negative[_-]?sampling[_-]?seed[_-]?(\d+)",
+        r"negseed[_-]?(\d+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, lower)
+        if m:
+            return int(m.group(1))
+    return np.nan
+
+
 def load_test_manifest(test_dir):
     test_dir = Path(test_dir)
     manifest_path = test_dir / "manifest.csv"
@@ -128,6 +228,13 @@ def load_test_manifest(test_dir):
 
             out = row.to_dict()
             out["resolved_file_path"] = str(path)
+
+            file_name_for_strategy = out.get("converted_file_name", path.name)
+            out["negative_sampling_strategy"] = resolve_strategy_from_manifest_or_name(
+                out.get("negative_sampling_strategy", np.nan),
+                file_name_for_strategy,
+            )
+
             rows.append(out)
 
         manifest = pd.DataFrame(rows)
@@ -149,7 +256,10 @@ def load_test_manifest(test_dir):
             "resolved_file_path": str(path),
             "format": "gnn",
             "graph_group": "graph_present",
-            "negative_sampling_strategy": infer_strategy_from_name(path.name),
+            "negative_sampling_strategy": resolve_strategy_from_manifest_or_name(
+                np.nan,
+                path.name,
+            ),
             "negative_ratio": infer_negative_ratio(df),
             "negative_sampling_seed": infer_seed_from_name(path.name),
             "positive_rows": int((df["label"] == 1).sum()),
@@ -161,32 +271,6 @@ def load_test_manifest(test_dir):
         raise FileNotFoundError(f"No CSV test files found under: {test_dir}")
 
     return pd.DataFrame(rows)
-
-
-def infer_strategy_from_name(name):
-    lower = name.lower()
-    if "degree" in lower:
-        return "degree_matched"
-    if "random" in lower:
-        return "random"
-    if "normal" in lower:
-        return "normal"
-    return "unknown"
-
-
-def infer_seed_from_name(name):
-    import re
-    lower = name.lower()
-    patterns = [
-        r"seed[_-]?(\d+)",
-        r"negative[_-]?sampling[_-]?seed[_-]?(\d+)",
-        r"negseed[_-]?(\d+)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, lower)
-        if m:
-            return int(m.group(1))
-    return np.nan
 
 
 def discover_model_paths(model_root, model_paths):
@@ -492,7 +576,7 @@ def write_txt_summary(summary_df, file_metrics_df, output_path):
     lines.append("")
     lines.append("Primary reporting convention:")
     lines.append("- AUROC is primarily reported for 1:1 test sets.")
-    lines.append("- AUPRC is primarily reported for 1:5 and 1:10 test sets.")
+    lines.append("- AUPRC is primarily reported for 1:4 and 1:9 test sets.")
     lines.append("- TopK, NDCG, MRR, and standard classification metrics are also computed.")
     lines.append("")
     lines.append(f"Number of evaluated model/test files: {len(file_metrics_df)}")
@@ -516,7 +600,7 @@ def write_txt_summary(summary_df, file_metrics_df, output_path):
                 f"± {row.get('auroc_std', np.nan):.6f}"
             )
 
-        if ratio in [5, 10]:
+        if ratio != 1:
             lines.append(
                 f"AUPRC: {row.get('auprc_mean', np.nan):.6f} "
                 f"± {row.get('auprc_std', np.nan):.6f}"
@@ -583,7 +667,17 @@ def main():
     test_manifest = load_test_manifest(test_dir)
     print(f"Found {len(test_manifest)} fixed GNN test files.")
 
-    print("Discovering model checkpoints...")
+    print("\nTest files by negative sampling strategy:")
+    print(
+        test_manifest
+        .groupby(["negative_sampling_strategy", "negative_ratio"], dropna=False)
+        .size()
+        .reset_index(name="n_files")
+        .sort_values(["negative_sampling_strategy", "negative_ratio"])
+        .to_string(index=False)
+    )
+
+    print("\nDiscovering model checkpoints...")
     model_paths = discover_model_paths(args.model_root, args.model_paths)
     print(f"Found {len(model_paths)} model checkpoints:")
     for p in model_paths:
@@ -631,7 +725,10 @@ def main():
             metrics = compute_metrics(df, prob_scores, threshold=args.threshold)
 
             negative_ratio = test_row.get("negative_ratio", infer_negative_ratio(df))
-            strategy = test_row.get("negative_sampling_strategy", infer_strategy_from_name(test_path.name))
+            strategy = resolve_strategy_from_manifest_or_name(
+                test_row.get("negative_sampling_strategy", np.nan),
+                test_path.name,
+            )
             neg_seed = test_row.get("negative_sampling_seed", infer_seed_from_name(test_path.name))
 
             metric_row = {

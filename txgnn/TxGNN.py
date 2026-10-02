@@ -387,20 +387,28 @@ class TxGNN:
         print('----- AUPRC Performance in Each Relation -----')
         print_dict(auprc_rel, dd_only = False)
         print('----------------------------------------------')
-        
-        
+
     def save_model(self, path):
         if not os.path.exists(path):
-            os.mkdir(path)
-        
+            os.makedirs(path, exist_ok=True)
+
         if self.config is None:
             raise ValueError('No model is initialized...')
-        
+
         with open(os.path.join(path, 'config.pkl'), 'wb') as f:
             pickle.dump(self.config, f)
-       
+
         torch.save(self.best_model.state_dict(), os.path.join(path, 'model.pt'))
-        #save_graphs(os.path.join(path, 'graph_dgl.bin', [self.G]))
+
+        # Save DGL graph node input embeddings.
+        # These are randomly initialized in model_initialize() and stored on self.G,
+        # not inside model.state_dict().
+        node_inp = {}
+        for ntype in self.G.ntypes:
+            if 'inp' in self.G.nodes[ntype].data:
+                node_inp[ntype] = self.G.nodes[ntype].data['inp'].detach().cpu()
+
+        torch.save(node_inp, os.path.join(path, 'node_inp.pt'))
     
     def predict(self, df):
         out = {}
@@ -503,27 +511,52 @@ class TxGNN:
                 pickle.dump(similar_diseases, f)
                       
         return similar_diseases
-                      
+
     def load_pretrained(self, path):
         ## load config file
-        
+
         with open(os.path.join(path, 'config.pkl'), 'rb') as f:
             config = pickle.load(f)
-            
+
         self.model_initialize(**config)
         self.config = config
-        #self.G = initialize_node_embedding(self.G, config['n_inp'])
-        
-        state_dict = torch.load(os.path.join(path, 'model.pt'), map_location = torch.device('cpu'))
+
+        node_inp_path = os.path.join(path, 'node_inp.pt')
+        if os.path.exists(node_inp_path):
+            node_inp = torch.load(node_inp_path, map_location=torch.device('cpu'))
+
+            for ntype, inp in node_inp.items():
+                if ntype not in self.G.ntypes:
+                    raise ValueError(
+                        f"Checkpoint node type {ntype} not found in current graph. "
+                        f"Available node types: {self.G.ntypes}"
+                    )
+
+                expected_shape = self.G.nodes[ntype].data['inp'].shape
+                if tuple(inp.shape) != tuple(expected_shape):
+                    raise ValueError(
+                        f"node_inp shape mismatch for node type {ntype}: "
+                        f"checkpoint {tuple(inp.shape)} vs current graph {tuple(expected_shape)}"
+                    )
+
+                self.G.nodes[ntype].data['inp'] = inp
+        else:
+            print(
+                f"WARNING: node_inp.pt not found in checkpoint: {path}. "
+                "Using newly initialized graph node input embeddings. "
+                "This is backward-compatible with old checkpoints, but predictions "
+                "after reload may not exactly reproduce the original training-time model."
+            )
+
+        state_dict = torch.load(os.path.join(path, 'model.pt'), map_location=torch.device('cpu'))
         if next(iter(state_dict))[:7] == 'module.':
-            # the pretrained model is from data-parallel module
             from collections import OrderedDict
             new_state_dict = OrderedDict()
             for k, v in state_dict.items():
-                name = k[7:] # remove `module.`
+                name = k[7:]
                 new_state_dict[name] = v
             state_dict = new_state_dict
-        
+
         self.model.load_state_dict(state_dict)
         self.model = self.model.to(self.device)
         self.best_model = self.model
